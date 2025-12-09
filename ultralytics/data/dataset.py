@@ -5,6 +5,7 @@ from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -236,6 +237,46 @@ class YOLODataset(BaseDataset):
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         return label
 
+    def _find_prompt_path(self, im_file: str) -> Optional[Path]:
+        """Return a probable prompt image path derived from the current image filename."""
+        p = Path(im_file)
+        stem = p.stem
+        candidates = []
+        if "target" in stem:
+            candidates.append(p.with_name(stem.replace("target", "prompt") + p.suffix))
+        candidates.append(p.with_name(f"{stem}_prompt{p.suffix}"))
+        for c in candidates:
+            if c.exists():
+                return c
+        return None
+
+    def load_prompt_image(self, im_file: str, target_shape=None):
+        """Load the paired prompt image; resize to target_shape (h, w) if provided."""
+        prompt_path = self._find_prompt_path(im_file)
+        if prompt_path is None:
+            return None, None
+
+        prompt = cv2.imread(str(prompt_path))
+        if prompt is None:
+            return None, None
+
+        if target_shape is not None:
+            th, tw = int(target_shape[0]), int(target_shape[1])
+            prompt = cv2.resize(prompt, (tw, th), interpolation=cv2.INTER_LINEAR)
+
+        return prompt, prompt.shape[:2]
+
+    def get_image_and_label(self, index):
+        label = super().get_image_and_label(index)
+
+        # Optional paired prompt image; resize to match current resized image
+        prompt_img, prompt_shape = self.load_prompt_image(label["im_file"], target_shape=label["img"].shape[:2])
+        if prompt_img is not None:
+            label["prompt_img"] = prompt_img
+            label["prompt_shape"] = prompt_shape
+        
+        return label
+
     @staticmethod
     def collate_fn(batch):
         """Collates data samples into batches."""
@@ -245,6 +286,8 @@ class YOLODataset(BaseDataset):
         for i, k in enumerate(keys):
             value = values[i]
             if k == "img":
+                value = torch.stack(value, 0)
+            if k == "prompt_img":
                 value = torch.stack(value, 0)
             if k == "texts":
                 value = torch.stack(value, 0)
