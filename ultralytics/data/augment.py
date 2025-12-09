@@ -1595,6 +1595,16 @@ class LetterBox:
             labels = self._update_labels(labels, ratio, left, top)
             labels["img"] = img
             labels["resized_shape"] = new_shape
+
+            if labels.get("prompt_img") is not None:
+                prompt_img = labels['prompt_img']
+                if shape[::-1] != new_unpad:  # resize
+                    prompt_img = cv2.resize(prompt_img, new_unpad, interpolation=cv2.INTER_LINEAR)
+                prompt_img = cv2.copyMakeBorder(
+                    prompt_img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
+                )  # add border
+                labels['prompt_img'] = prompt_img
+
             return labels
         else:
             return img
@@ -2065,6 +2075,9 @@ class Format:
         if self.normalize:
             labels["bboxes"][:, [0, 2]] /= w
             labels["bboxes"][:, [1, 3]] /= h
+        # Optional prompt image tensor
+        if "prompt_img" in labels:
+            labels["prompt_img"] = self._format_img(labels["prompt_img"])
         # Then we can use collate_fn
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
