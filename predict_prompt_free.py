@@ -1,5 +1,6 @@
 from ultralytics import YOLOE
 from ultralytics.models.yolo.yoloe.val_pe_free import YOLOEPEFreeDetectValidator
+from huggingface_hub import hf_hub_download
 
 unfused_model = YOLOE("yoloe-v8l.yaml")
 unfused_model.load("pretrain/yoloe-v8l-seg.pt")
@@ -10,13 +11,15 @@ with open('tools/ram_tag_list.txt', 'r') as f:
     names = [x.strip() for x in f.readlines()]
 vocab = unfused_model.get_vocab(names)
 
-model = YOLOE("pretrain/yoloe-v8l-seg-pf.pt").cuda()
+path = hf_hub_download(repo_id="jameslahm/yoloe", filename="yoloe-v8l-seg-pf.pt")
+model = YOLOE(path).cuda()
+model.eval()
 model.set_vocab(vocab, names=names)
 model.model.model[-1].is_fused = True
 model.model.model[-1].conf = 0.001
 model.model.model[-1].max_det = 1000
 
-filename = "ultralytics/cfg/datasets/lvis.yaml"
+# filename = "ultralytics/cfg/datasets/lvis.yaml"
 
-model.predict('ultralytics/assets/bus.jpg', save=True)
+model.predict(source='ultralytics/assets/bus.jpg', imgsz=640, save=True, conf=0.25, iou=0.7)
 

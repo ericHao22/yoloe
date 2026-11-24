@@ -17,18 +17,22 @@ from huggingface_hub import hf_hub_download
 
 from ultralytics import YOLOE
 from ultralytics.models.yolo.segment import SegmentationValidator
+from ultralytics.models.yolo.yoloe.val import YOLOEValidatorMixin
+from ultralytics.nn.text_model import build_text_model
 from ultralytics.utils import LOGGER
 
 
-class PromptFreeSegmentationValidator(SegmentationValidator):
+class PromptFreeSegmentationValidator(YOLOEValidatorMixin, SegmentationValidator):
     """Segmentation validator that injects prompt-free class priors each batch."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pf_model = None
+        self.tpe_model = build_text_model(self.args.get("text_model"), device=self.device)
         self.max_prompt_classes = getattr(self.args, "max_prompt_classes", 80)
-        self.similarity_threshold = getattr(self.args, "similarity_threshold", 0.5)
+        self.similarity_threshold = getattr(self.args, "similarity_threshold", 0.8)
         self.target_classes = list(['person', 'dog'])
+        self.allowed_classes = None  # per-batch filter (keeps metrics mapping stable)
 
     def init_metrics(self, model):
         super().init_metrics(model)
@@ -62,6 +66,7 @@ class PromptFreeSegmentationValidator(SegmentationValidator):
     def preprocess(self, batch):
         batch = super().preprocess(batch)
         if "prompt_img" not in batch:
+            self.allowed_classes = None
             return batch
         # infer prompt classes
         batch["prompt_img"] = batch["prompt_img"].to(self.device)
@@ -72,19 +77,11 @@ class PromptFreeSegmentationValidator(SegmentationValidator):
         prompt_classes = self._infer_prompt_classes(batch["prompt_img"])
 
         if prompt_classes:
-            # Filter target classes by similarity to prompt classes
             filtered_classes = self._filter_by_similarity(prompt_classes, self.target_classes)
-            
-            if filtered_classes:
-                self.model.model.set_classes(filtered_classes, self.model.model.get_text_pe(filtered_classes))
-                self.nc = len(filtered_classes)
-            else:
-                LOGGER.warning('No classes passed similarity threshold; resetting to no class filter.')
-                self.model.model.set_classes([], None)
-                self.nc = 0
+            self.allowed_classes = filtered_classes if filtered_classes else None
         else:
             LOGGER.warning('No classes detected in prompt image; skipping setting classes.')
-
+            self.allowed_classes = None
         return batch
 
     @torch.no_grad()
@@ -104,6 +101,16 @@ class PromptFreeSegmentationValidator(SegmentationValidator):
         return prompt_classes
 
     @torch.no_grad()
+    def _get_classes_embeddings(self, class_names) -> torch.Tensor:
+        """Get text embeddings for given class names using the CLIP model."""
+        if not class_names:
+            return None
+        text_token = self.tpe_model.tokenize(class_names)
+        txt_feats = self.tpe_model.encode_text(text_token)
+        txt_feats = txt_feats.reshape(-1, len(class_names), txt_feats.shape[-1])
+        return txt_feats
+
+    @torch.no_grad()
     def _filter_by_similarity(self, prompt_classes: List[str], target_classes: List[str]) -> List[str]:
         """Filter target classes based on text embedding similarity to prompt classes.
         
@@ -120,8 +127,8 @@ class PromptFreeSegmentationValidator(SegmentationValidator):
         
         try:
             # Get embeddings for both prompt and target classes
-            prompt_embeddings = self.model.model.get_text_pe(prompt_classes)  # (1, len(prompt), 512)
-            target_embeddings = self.model.model.get_text_pe(target_classes)  # (1, len(target), 512)
+            prompt_embeddings = self._get_classes_embeddings(prompt_classes)  # (1, len(prompt), 512)
+            target_embeddings = self._get_classes_embeddings(target_classes)  # (1, len(target), 512)
             
             # Normalize embeddings
             prompt_emb = F.normalize(prompt_embeddings.squeeze(0), dim=-1)  # (len(prompt), 512)
@@ -146,3 +153,32 @@ class PromptFreeSegmentationValidator(SegmentationValidator):
         except Exception as e:
             LOGGER.warning(f'Similarity filtering failed: {e}; using prompt classes directly')
             return prompt_classes
+
+    def postprocess(self, preds):
+        p, proto = super().postprocess(preds)
+
+        if not getattr(self, "allowed_classes", None):
+            return p, proto
+
+        # map class names to ids in the fixed dataset order
+        name_to_id = (
+            {v: k for k, v in self.names.items()}
+            if isinstance(self.names, dict)
+            else {n: i for i, n in enumerate(self.names)}
+        )
+        # select a proper device for keep_ids
+        device = p[0].device if isinstance(p, (list, tuple)) and len(p) and isinstance(p[0], torch.Tensor) else self.device
+        keep_ids = torch.tensor([name_to_id[c] for c in self.allowed_classes if c in name_to_id], device=device)
+
+        # filter per-image predictions by class column (index 5)
+        for i in range(len(p)):
+            pred = p[i]
+            if pred is None or pred.numel() == 0:
+                continue
+            if keep_ids.numel() == 0:
+                p[i] = pred[0:0]  # no classes to keep, return empty tensor
+                continue
+            keep = torch.isin(pred[:, 5].to(keep_ids.device), keep_ids)
+            p[i] = pred[keep]
+
+        return p, proto
